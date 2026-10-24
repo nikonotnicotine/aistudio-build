@@ -1,0 +1,34 @@
+# 认证凭据 —— 明文 Google 活跃会话，等同账号密码，严禁提交
+auth/
+single-line-auth/
+.auth
+
+# 本地配置（含 apiKeys / targetUrl / camoufox 直链）
+config.json
+state.json
+app.env
+.env
+*.env
+!app.env.example
+data/
+
+# camoufox 浏览器本体
+camoufox/
+camoufox-linux/
+
+# 依赖与日志
+node_modules/
+logs/
+*.log
+npm-debug.log*
+
+# 运行时产物与备份
+screenshots/
+shots/
+*.png
+*.bak
+
+# 系统文件
+Thumbs.db
+desktop.ini
+.DS_Store

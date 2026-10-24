@@ -26,7 +26,7 @@ RUN curl -sSL ${CAMOUFOX_URL} -o camoufox-linux.tar.gz && \
 
 # 4. 【核心优化】现在，才拷贝你经常变动的代码文件。
 # 这一步放在后面，确保你修改代码时，前面所有重量级的层都能利用缓存。
-COPY unified-server.js black-browser.js models.json ./
+COPY unified-server.js black-browser.js panel.js state-store.js models.json ./
 
 # 5. [保持不变] 创建目录并设置权限。
 # 注意：chown应在拷贝文件后进行，确保所有文件权限正确。

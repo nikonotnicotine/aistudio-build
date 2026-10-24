@@ -1,0 +1,56 @@
+# aistudio-build —— VPS 长跑用
+#
+# 用法：
+#   1. cp app.env.example app.env   然后填好里面的值
+#   2. docker compose build          首次构建需要 CAMOUFOX_URL
+#   3. docker compose up -d
+#
+# 凭证有两种给法，二选一：
+#   A. 挂 auth 目录（推荐，多账号方便）：用下面的 ./auth 挂载，
+#      把 auth-1.json / auth-2.json 放进去，app.env 里不要设 AUTH_JSON_1
+#   B. 走环境变量：在 app.env 里设 AUTH_JSON_1=<auth-single-1.json 的全部内容>
+#      一旦检测到 AUTH_JSON_1，服务就不再读 auth/ 目录
+
+services:
+  aistudio-build:
+    build:
+      context: .
+      args:
+        # Linux 版 camoufox 的 tar.gz 直链，见 README
+        CAMOUFOX_URL: ${CAMOUFOX_URL}
+    image: aistudio-build:local
+    container_name: aistudio-build
+    restart: always
+
+    env_file:
+      - app.env
+
+    ports:
+      # 只映射 7860。9998 是容器内部 WebSocket，不要对外暴露。
+      # 想只让本机访问就改成 "127.0.0.1:7860:7860"，再用 Nginx 套 HTTPS。
+      - "7860:7860"
+
+    volumes:
+      # 凭证（方式 A）。只读挂载，容器不需要写它。
+      - ./auth:/app/auth:ro
+      # 面板设置与凭证状态。不挂的话容器重启就丢。
+      - ./data:/app/data
+
+    environment:
+      # state.json 写到挂载卷里，重启才留得住
+      STATE_DIR: /app/data
+
+    # 浏览器需要较大的共享内存，否则容易崩
+    shm_size: "1gb"
+
+    # 2C2G 机器上给容器留点余量，避免 OOM 把整台机器拖死
+    deploy:
+      resources:
+        limits:
+          memory: 1600M
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

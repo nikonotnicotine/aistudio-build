@@ -9,13 +9,21 @@ const fs = require("fs");
 const path = require("path");
 const { firefox } = require("playwright");
 const os = require("os");
+const {
+  StateStore,
+  maskSecret,
+  cookiesToStorageState,
+  validateStorageState,
+} = require("./state-store.js");
+const { renderPanel } = require("./panel.js");
 
 // ===================================================================================
 // AUTH SOURCE MANAGEMENT MODULE
 // ===================================================================================
 class AuthSource {
-  constructor(logger) {
+  constructor(logger, stateStore) {
     this.logger = logger;
+    this.stateStore = stateStore || null;
     this.authMode = "file";
     this.availableIndices = [];
     this.initialIndices = [];
@@ -87,7 +95,10 @@ class AuthSource {
   }
 
   _preValidateAndFilter() {
-    if (this.availableIndices.length === 0) return;
+    if (this.availableIndices.length === 0) {
+      this.validIndices = [];
+      return;
+    }
 
     this.logger.info("[Auth] 开始预检验所有认证源的JSON格式...");
     const validIndices = [];
@@ -122,7 +133,36 @@ class AuthSource {
       );
     }
 
-    this.availableIndices = validIndices;
+    // 面板上被关闭或被封禁的凭证，不参与轮询
+    if (this.stateStore) {
+      const filtered = validIndices.filter((i) => this.stateStore.isUsable(i));
+      const skipped = validIndices.filter((i) => !this.stateStore.isUsable(i));
+      if (skipped.length > 0) {
+        this.logger.info(
+          `[Auth] 以下凭证已被关闭或封禁，不参与轮询: [${skipped.join(", ")}]`,
+        );
+      }
+      this.availableIndices = filtered;
+    } else {
+      this.availableIndices = validIndices;
+    }
+
+    // 预检验通过但被停用的，仍记录在 validIndices 里供面板展示
+    this.validIndices = validIndices;
+  }
+
+  // 运行时重新扫描 auth/ 目录，让面板导入的新凭证不重启即可生效
+  rescan() {
+    this.accountNameMap = new Map();
+    this._discoverAvailableIndices();
+    this._preValidateAndFilter();
+    this.logger.info(
+      `[Auth] 重新扫描完成：发现 ${this.initialIndices.length} 个，可用 ${this.availableIndices.length} 个。`,
+    );
+    return {
+      initial: this.initialIndices,
+      available: this.availableIndices,
+    };
   }
 
   // 一个内部辅助函数，仅用于预检验，避免日志污染
@@ -167,10 +207,11 @@ class AuthSource {
 // ===================================================================================
 
 class BrowserManager {
-  constructor(logger, config, authSource) {
+  constructor(logger, config, authSource, stateStore) {
     this.logger = logger;
     this.config = config;
     this.authSource = authSource;
+    this.stateStore = stateStore || null;
     this.browser = null;
     this.context = null;
     this.page = null;
@@ -305,10 +346,12 @@ class BrowserManager {
         // 只关注主框架的跳转
         if (frame === this.page.mainFrame()) {
           const newUrl = frame.url();
-          if (
-            newUrl !== "about:blank" &&
-            !newUrl.includes(this.config.targetUrl)
-          ) {
+          // 用专属 app 链接时也要认，否则每次导航都会误报
+          const expected =
+            (this.stateStore &&
+              this.stateStore.credTargetUrl(this.currentAuthIndex)) ||
+            this.config.targetUrl;
+          if (newUrl !== "about:blank" && !newUrl.includes(expected)) {
             this.logger.warn(
               `⚠️ [Browser] 页面发生了意外导航/刷新！新 URL: ${newUrl}`,
             );
@@ -331,7 +374,14 @@ class BrowserManager {
       });
 
       this.logger.info(`[Browser] 正在导航至目标网页...`);
-      const targetUrl = this.config.targetUrl;
+      // 每个账号可配自己的 app 链接。app 不属于当前登录账号会 404，
+      // 所以多号场景必须按号区分，没配的回落到全局 targetUrl。
+      const perAccountUrl =
+        this.stateStore && this.stateStore.credTargetUrl(authIndex);
+      const targetUrl = perAccountUrl || this.config.targetUrl;
+      if (perAccountUrl) {
+        this.logger.info(`[Browser]    • 使用账号 #${authIndex} 的专属 app 链接`);
+      }
       await this.page.goto(targetUrl, {
         timeout: 180000,
         waitUntil: "domcontentloaded",
@@ -1018,6 +1068,7 @@ class RequestHandler {
     this.isAuthSwitching = false;
     this.needsSwitchingAfterRequest = false;
     this.isSystemBusy = false;
+    this.currentModel = null;
   }
 
   get currentAuthIndex() {
@@ -1176,11 +1227,45 @@ class RequestHandler {
   }
 
   async _handleRequestFailureAndSwitch(errorDetails, res) {
+    const store = this.serverSystem && this.serverSystem.stateStore;
+
+    // 429：只冷却撞墙的那个模型族，而不是认为整个账号不可用。
+    // 按实测额度，3.7/3.8 flash 共享额度、3.5 系各自独立，所以族粒度比账号粒度准。
+    if (
+      store &&
+      this.config.cooldownEnabled &&
+      errorDetails.status === 429 &&
+      this.currentModel
+    ) {
+      const family = store.familyOf(this.currentModel, this.config);
+      const minutes = this.config.cooldownMinutes || 60;
+      store.cooldown(this.currentAuthIndex, family, minutes);
+      this.logger.warn(
+        `[Quota] 账号 #${this.currentAuthIndex} 模型族 "${family}" 收到 429，已冷却 ${minutes} 分钟。`,
+      );
+    }
+
+    // 自动封禁：命中配置的状态码（默认 403）时停用该凭证，不再参与轮询
+    if (
+      store &&
+      this.config.autoBanEnabled &&
+      (this.config.autoBanStatusCodes || []).includes(errorDetails.status)
+    ) {
+      store.ban(
+        this.currentAuthIndex,
+        `自动封禁：状态码 ${errorDetails.status}`,
+      );
+      this.logger.error(
+        `[AutoBan] 账号 #${this.currentAuthIndex} 收到状态码 ${errorDetails.status}，已自动封禁并移出轮询。`,
+      );
+      this.authSource.rescan();
+    }
+
     // 失败计数逻辑
     if (this.config.failureThreshold > 0) {
       this.failureCount++;
       this.logger.warn(
-        `⚠️ [Auth] 请求失败 - 失败计数: ${this.failureCount}/${this.config.failureThreshold} (当前账号索引: ${this.currentAuthIndex})`,
+        `[Auth] 请求失败 - 失败计数: ${this.failureCount}/${this.config.failureThreshold} (当前账号索引: ${this.currentAuthIndex})`,
       );
     }
 
@@ -1311,6 +1396,31 @@ class RequestHandler {
       req.method === "POST" &&
       (req.path.includes("generateContent") ||
         req.path.includes("streamGenerateContent"));
+
+    // 记下本次请求的模型，供 429 模型族冷却和本地用量计数使用
+    if (isGenerativeRequest) {
+      const m = req.path.match(/\/models\/([^:]+):/);
+      this.currentModel = m ? m[1] : null;
+      const store = this.serverSystem && this.serverSystem.stateStore;
+      if (store && this.currentModel) {
+        const family = store.familyOf(this.currentModel, this.config);
+        if (store.isCoolingDown(this.currentAuthIndex, family)) {
+          const leftMin = Math.ceil(
+            store.cooldownRemaining(this.currentAuthIndex, family) / 60000,
+          );
+          this.logger.warn(
+            `[Quota] 账号 #${this.currentAuthIndex} 的模型族 "${family}" 正在冷却中（约 ${leftMin} 分钟），尝试切换账号...`,
+          );
+          if (this.authSource.availableIndices.length > 1) {
+            this._switchToNextAuth().catch((err) =>
+              this.logger.error(`[Quota] 冷却触发的切换失败: ${err.message}`),
+            );
+          }
+        }
+        store.recordUse(this.currentAuthIndex, this.currentModel);
+      }
+    }
+
     if (this.config.switchOnUses > 0 && isGenerativeRequest) {
       this.usageCount++;
       this.logger.info(
@@ -1377,6 +1487,29 @@ class RequestHandler {
     const model = req.body.model || "gemini-1.5-pro-latest";
     const systemStreamMode = this.serverSystem.streamingMode;
     const useRealStream = isOpenAIStream && systemStreamMode === "real";
+
+    // 与谷歌格式一致：记录模型，参与模型族冷却与本地用量计数
+    this.currentModel = model;
+    {
+      const store = this.serverSystem && this.serverSystem.stateStore;
+      if (store) {
+        const family = store.familyOf(model, this.config);
+        if (store.isCoolingDown(this.currentAuthIndex, family)) {
+          const leftMin = Math.ceil(
+            store.cooldownRemaining(this.currentAuthIndex, family) / 60000,
+          );
+          this.logger.warn(
+            `[Quota] 账号 #${this.currentAuthIndex} 的模型族 "${family}" 正在冷却中（约 ${leftMin} 分钟），尝试切换账号...`,
+          );
+          if (this.authSource.availableIndices.length > 1) {
+            this._switchToNextAuth().catch((err) =>
+              this.logger.error(`[Quota] 冷却触发的切换失败: ${err.message}`),
+            );
+          }
+        }
+        store.recordUse(this.currentAuthIndex, model);
+      }
+    }
 
     if (this.config.switchOnUses > 0) {
       this.usageCount++;
@@ -1903,6 +2036,44 @@ class RequestHandler {
     }
   }
 
+  // 面板"实测"用：发一次真实请求并把结果原样返回。
+  // 刻意不走 _handleRequestFailureAndSwitch —— 测试一个坏号不应该连带触发
+  // 切号、冷却或自动封禁，它只负责报告。
+  async _executeProbe(proxyRequest) {
+    const messageQueue = this.connectionRegistry.createMessageQueue(
+      proxyRequest.request_id,
+    );
+    try {
+      this._forwardRequest(proxyRequest);
+
+      const headerMessage = await messageQueue.dequeue(60000);
+      if (headerMessage.event_type === "error") {
+        return {
+          status: headerMessage.status || 500,
+          body: headerMessage.message || "(无错误信息)",
+        };
+      }
+
+      let fullBody = "";
+      while (true) {
+        const message = await messageQueue.dequeue(120000);
+        if (message.type === "STREAM_END") break;
+        if (message.event_type === "chunk" && message.data) {
+          fullBody += message.data;
+        }
+      }
+
+      return { status: headerMessage.status || 200, body: fullBody };
+    } catch (e) {
+      return {
+        status: 504,
+        body: e.message === "Queue timeout" ? "等待浏览器响应超时。" : e.message,
+      };
+    } finally {
+      this.connectionRegistry.removeMessageQueue(proxyRequest.request_id);
+    }
+  }
+
   async _handleNonStreamResponse(proxyRequest, messageQueue, res) {
     this.logger.info(`[Request] 进入非流式处理模式...`);
 
@@ -2332,15 +2503,21 @@ class ProxyServerSystem extends EventEmitter {
     super();
     this.logger = new LoggingService("ProxySystem");
     this._loadConfiguration(); // 这个函数会执行下面的_loadConfiguration
+
+    // 面板设置与凭证元数据（独立文件，项目更新覆盖本文件时不会丢）
+    this.stateStore = new StateStore(this.logger);
+    this.stateStore.applyTo(this.config);
+
     this.streamingMode = this.config.streamingMode;
 
     this.forceThinking = false;
 
-    this.authSource = new AuthSource(this.logger);
+    this.authSource = new AuthSource(this.logger, this.stateStore);
     this.browserManager = new BrowserManager(
       this.logger,
       this.config,
       this.authSource,
+      this.stateStore,
     );
     this.connectionRegistry = new ConnectionRegistry(this.logger);
     this.requestHandler = new RequestHandler(
@@ -2357,6 +2534,78 @@ class ProxyServerSystem extends EventEmitter {
   }
 
   // ===== 所有函数都已正确放置在类内部 =====
+
+  // 汇总面板与 /api/status 共用的运行时状态
+  _collectStatus() {
+    const { config, requestHandler, authSource, browserManager, stateStore } =
+      this;
+    const initialIndices = authSource.initialIndices || [];
+    const validIndices = authSource.validIndices || [];
+    const availableIndices = authSource.availableIndices || [];
+    const nameMap = authSource.accountNameMap;
+
+    const credentials = initialIndices.map((index) => {
+      const valid = validIndices.includes(index);
+      const meta = stateStore.cred(index);
+      return {
+        index,
+        name: valid ? nameMap.get(index) || "未命名" : "JSON 格式错误",
+        valid,
+        enabled: meta.enabled,
+        banned: meta.banned,
+        banReason: meta.banReason,
+        lastCheck: meta.lastCheck,
+        lastCheckOk: meta.lastCheckOk,
+        usageToday: stateStore.usageToday(index),
+        targetUrl: meta.targetUrl || null,
+      };
+    });
+
+    const logs = this.logger.logBuffer || [];
+
+    return {
+      credentials,
+      cooldowns: stateStore.activeCooldowns(),
+      logs: logs.join("\n"),
+      logCount: logs.length,
+      status: {
+        browserConnected: !!browserManager.browser,
+        currentAuthIndex: requestHandler.currentAuthIndex,
+        usageCount: `${requestHandler.usageCount} / ${
+          config.switchOnUses > 0 ? config.switchOnUses : "关闭"
+        }`,
+        failureCount: `${requestHandler.failureCount} / ${
+          config.failureThreshold > 0 ? config.failureThreshold : "关闭"
+        }`,
+        streamingMode: this.streamingMode,
+        forceThinking: this.forceThinking,
+        usableCount: availableIndices.length,
+        totalCount: initialIndices.length,
+      },
+    };
+  }
+
+  _renderPanelHtml() {
+    const d = this._collectStatus();
+    return renderPanel({
+      config: this.config,
+      streamingMode: this.streamingMode,
+      forceThinking: this.forceThinking,
+      browserConnected: d.status.browserConnected,
+      currentAuthIndex: this.requestHandler.currentAuthIndex,
+      usageCount: this.requestHandler.usageCount,
+      failureCount: this.requestHandler.failureCount,
+      credentials: d.credentials,
+      cooldowns: d.cooldowns,
+      modelList: this.config.modelList || [],
+      logs: this.logger.logBuffer || [],
+      maskedKeys: (this.config.apiKeys || []).map(maskSecret).join(", "),
+      hasPanelPassword: this.stateStore.hasPanelPassword(),
+      authMode: this.authSource.authMode,
+      theme: this.config.theme || "light",
+      activeTab: "status",
+    });
+  }
 
   _loadConfiguration() {
     let config = {
@@ -2447,9 +2696,11 @@ class ProxyServerSystem extends EventEmitter {
     if (config.apiKeys.length > 0) {
       config.apiKeySource = "自定义";
     } else {
-      config.apiKeys = ["123456"];
+      config.apiKeys = ["build"];
       config.apiKeySource = "默认";
-      this.logger.info("[System] 未设置任何API Key，已启用默认密码: 123456");
+      this.logger.warn(
+        "[System] 未设置任何 API Key，已启用默认密码: build —— 公网暴露前请务必改掉！",
+      );
     }
 
     const modelsPath = path.join(__dirname, "models.json");
@@ -2703,19 +2954,57 @@ class ProxyServerSystem extends EventEmitter {
       if (req.session.isAuthenticated) {
         return res.redirect("/");
       }
-      const loginHtml = `
-      <!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><title>登录</title>
-      <style>body{display:flex;justify-content:center;align-items:center;height:100vh;font-family:sans-serif;background:#f0f2f5}form{background:white;padding:40px;border-radius:10px;box-shadow:0 4px 8px rgba(0,0,0,0.1);text-align:center}input{width:250px;padding:10px;margin-top:10px;border:1px solid #ccc;border-radius:5px}button{width:100%;padding:10px;background-color:#007bff;color:white;border:none;border-radius:5px;margin-top:20px;cursor:pointer}.error{color:red;margin-top:10px}</style>
-      </head><body><form action="/login" method="post"><h2>请输入 API Key</h2>
-      <input type="password" name="apiKey" placeholder="API Key" required autofocus><button type="submit">登录</button>
-      ${
-        req.query.error ? '<p class="error">API Key 错误!</p>' : ""
-      }</form></body></html>`;
+      const label = this.stateStore.hasPanelPassword()
+        ? "面板密码"
+        : "API Key";
+      const loginHtml = `<!DOCTYPE html>
+<html lang="zh-CN"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AIS2API</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{min-height:100vh;display:flex;align-items:center;justify-content:center;
+ background:#fbfbfb;color:#0f0f0f;padding:24px;
+ font:400 14px/1.6 -apple-system,BlinkMacSystemFont,'Segoe UI',
+ 'PingFang SC','Hiragino Sans GB','Microsoft YaHei',sans-serif;
+ -webkit-font-smoothing:antialiased}
+form{width:100%;max-width:370px;border:1px solid #c9c9c9;background:#fff;padding:40px 32px}
+.brand{font-size:12px;letter-spacing:.14em;color:#4f4f4f;
+ font-family:ui-monospace,Menlo,Consolas,monospace}
+h1{font-size:22px;font-weight:600;letter-spacing:-.01em;margin:13px 0 4px}
+.sub{font-size:13px;color:#4f4f4f;margin-bottom:28px}
+label{display:block;font-size:13px;font-weight:500;color:#2b2b2b;margin-bottom:8px}
+input{width:100%;padding:11px 13px;background:#fbfbfb;border:1px solid #c9c9c9;
+ color:#0f0f0f;font:inherit;outline:none;transition:border-color .15s}
+input:focus{border-color:#4f4f4f}
+button{width:100%;padding:12px;margin-top:20px;background:#141414;color:#fff;
+ border:none;font:inherit;font-size:14px;font-weight:500;cursor:pointer;
+ transition:opacity .15s}
+button:hover{opacity:.86}
+.err{margin-top:16px;padding:10px 13px;border-left:2px solid #707070;
+ background:#f3f3f3;font-size:13px;color:#2b2b2b}
+.foot{margin-top:28px;padding-top:18px;border-top:1px solid #e2e2e2;
+ font-size:12px;color:#707070;line-height:1.7}
+</style></head>
+<body><form action="/login" method="post">
+<div class="brand">AIS2API</div>
+<h1>反向代理控制台</h1>
+<div class="sub">AI Studio Build</div>
+<label for="k">${label}</label>
+<input id="k" type="password" name="apiKey" required autofocus autocomplete="current-password">
+<button type="submit">登录</button>
+${req.query.error ? `<div class="err">${label}不正确</div>` : ""}
+<div class="foot">CC BY-NC 4.0&nbsp;&middot;&nbsp;禁止商业使用<br>仅供学习与研究</div>
+</form></body></html>`;
       res.send(loginHtml);
     });
     app.post("/login", (req, res) => {
       const { apiKey } = req.body;
-      if (apiKey && this.config.apiKeys.includes(apiKey)) {
+      // 设了面板独立密码就只认它（存哈希）；否则沿用 API Key 登录
+      const ok = this.stateStore.hasPanelPassword()
+        ? this.stateStore.verifyPanelPassword(apiKey || "")
+        : !!apiKey && this.config.apiKeys.includes(apiKey);
+      if (ok) {
         req.session.isAuthenticated = true;
         res.redirect("/");
       } else {
@@ -2727,251 +3016,12 @@ class ProxyServerSystem extends EventEmitter {
     // Section 3: 状态页面 和 API (最终版)
     // ==========================================================
     app.get("/", isAuthenticated, (req, res) => {
-      const { config, requestHandler, authSource, browserManager } = this;
-      const initialIndices = authSource.initialIndices || [];
-      const availableIndices = authSource.availableIndices || [];
-      const invalidIndices = initialIndices.filter(
-        (i) => !availableIndices.includes(i),
-      );
-      const logs = this.logger.logBuffer || [];
-
-      const accountNameMap = authSource.accountNameMap;
-      const accountDetailsHtml = initialIndices
-        .map((index) => {
-          const isInvalid = invalidIndices.includes(index);
-          const name = isInvalid
-            ? "N/A (JSON格式错误)"
-            : accountNameMap.get(index) || "N/A (未命名)";
-          return `<span class="label" style="padding-left: 20px;">账号${index}</span>: ${name}`;
-        })
-        .join("\n");
-
-      const accountOptionsHtml = availableIndices
-        .map((index) => `<option value="${index}">账号 #${index}</option>`)
-        .join("");
-
-      const statusHtml = `
-    <!DOCTYPE html>
-    <html lang="zh-CN">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>代理服务状态</title>
-        <style>
-        body { font-family: 'SF Mono', 'Consolas', 'Menlo', monospace; background-color: #f0f2f5; color: #333; padding: 2em; }
-        .container { max-width: 800px; margin: 0 auto; background: #fff; padding: 1em 2em 2em 2em; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
-        h1, h2 { color: #333; border-bottom: 2px solid #eee; padding-bottom: 0.5em;}
-        pre { background: #2d2d2d; color: #f0f0f0; font-size: 1.1em; padding: 1.5em; border-radius: 8px; white-space: pre-wrap; word-wrap: break-word; line-height: 1.6; }
-        #log-container { font-size: 0.9em; max-height: 400px; overflow-y: auto; }
-        .status-ok { color: #2ecc71; font-weight: bold; }
-        .status-error { color: #e74c3c; font-weight: bold; }
-        .label { display: inline-block; width: 220px; box-sizing: border-box; }
-        .dot { height: 10px; width: 10px; background-color: #bbb; border-radius: 50%; display: inline-block; margin-left: 10px; animation: blink 1s infinite alternate; }
-        @keyframes blink { from { opacity: 0.3; } to { opacity: 1; } }
-        .action-group { display: flex; flex-wrap: wrap; gap: 15px; align-items: center; }
-        .action-group button, .action-group select { font-size: 1em; border: 1px solid #ccc; padding: 10px 15px; border-radius: 8px; cursor: pointer; transition: background-color 0.3s ease; }
-        .action-group button:hover { opacity: 0.85; }
-        .action-group button { background-color: #007bff; color: white; border-color: #007bff; }
-        .action-group select { background-color: #ffffff; color: #000000; -webkit-appearance: none; appearance: none; }
-        @media (max-width: 600px) {
-            body { padding: 0.5em; }
-            .container { padding: 1em; margin: 0; }
-            pre { padding: 1em; font-size: 0.9em; }
-            .label { width: auto; display: inline; }
-            .action-group { flex-direction: column; align-items: stretch; }
-            .action-group select, .action-group button { width: 100%; box-sizing: border-box; }
-        }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-        <h1>代理服务状态 <span class="dot" title="数据动态刷新中..."></span></h1>
-        <div id="status-section">
-            <pre>
-<span class="label">服务状态</span>: <span class="status-ok">Running</span>
-<span class="label">浏览器连接</span>: <span class="${
-        browserManager.browser ? "status-ok" : "status-error"
-      }">${!!browserManager.browser}</span>
---- 服务配置 ---
-<span class="label">流模式</span>: ${
-        config.streamingMode
-      } (仅启用流式传输时生效)
-<span class="label">强制推理</span>: ${
-        this.forceThinking ? "✅ 已启用" : "❌ 已关闭"
-      }
-<span class="label">立即切换 (状态码)</span>: ${
-        config.immediateSwitchStatusCodes.length > 0
-          ? `[${config.immediateSwitchStatusCodes.join(", ")}]`
-          : "已禁用"
-      }
-<span class="label">API 密钥</span>: ${config.apiKeySource}
---- 账号状态 ---
-<span class="label">当前使用账号</span>: #${requestHandler.currentAuthIndex}
-<span class="label">使用次数计数</span>: ${requestHandler.usageCount} / ${
-        config.switchOnUses > 0 ? config.switchOnUses : "N/A"
-      }
-<span class="label">连续失败计数</span>: ${requestHandler.failureCount} / ${
-        config.failureThreshold > 0 ? config.failureThreshold : "N/A"
-      }
-<span class="label">扫描到的总帐号</span>: [${initialIndices.join(
-        ", ",
-      )}] (总数: ${initialIndices.length})
-      ${accountDetailsHtml}
-<span class="label">格式错误 (已忽略)</span>: [${invalidIndices.join(
-        ", ",
-      )}] (总数: ${invalidIndices.length})
-            </pre>
-        </div>
-        <div id="actions-section" style="margin-top: 2em;">
-            <h2>操作面板</h2>
-            <div class="action-group">
-                <select id="accountIndexSelect">${accountOptionsHtml}</select>
-                <button onclick="switchSpecificAccount()">切换账号</button>
-                <button onclick="toggleStreamingMode()">切换流模式</button>
-                <button onclick="toggleForceThinking()">切换强制推理</button>
-            </div>
-        </div>
-        <div id="log-section" style="margin-top: 2em;">
-            <h2>实时日志 (最近 ${logs.length} 条)</h2>
-            <pre id="log-container">${logs.join("\n")}</pre>
-        </div>
-        </div>
-        <script>
-        function updateContent() {
-            fetch('/api/status').then(response => response.json()).then(data => {
-                const statusPre = document.querySelector('#status-section pre');
-                const accountDetailsHtml = data.status.accountDetails.map(acc => {
-                  return '<span class="label" style="padding-left: 20px;">账号' + acc.index + '</span>: ' + acc.name;
-                }).join('\\n');
-                statusPre.innerHTML = 
-                    '<span class="label">服务状态</span>: <span class="status-ok">Running</span>\\n' +
-                    '<span class="label">浏览器连接</span>: <span class="' + (data.status.browserConnected ? "status-ok" : "status-error") + '">' + data.status.browserConnected + '</span>\\n' +
-                    '--- 服务配置 ---\\n' +
-                    '<span class="label">流模式</span>: ' + data.status.streamingMode + '\\n' +
-                    '<span class="label">强制推理</span>: ' + data.status.forceThinking + '\\n' +
-                    '<span class="label">立即切换 (状态码)</span>: ' + data.status.immediateSwitchStatusCodes + '\\n' +
-                    '<span class="label">API 密钥</span>: ' + data.status.apiKeySource + '\\n' +
-                    '--- 账号状态 ---\\n' +
-                    '<span class="label">当前使用账号</span>: #' + data.status.currentAuthIndex + '\\n' +
-                    '<span class="label">使用次数计数</span>: ' + data.status.usageCount + '\\n' +
-                    '<span class="label">连续失败计数</span>: ' + data.status.failureCount + '\\n' +
-                    '<span class="label">扫描到的总账号</span>: ' + data.status.initialIndices + '\\n' +
-                    accountDetailsHtml + '\\n' +
-                    '<span class="label">格式错误 (已忽略)</span>: ' + data.status.invalidIndices;
-                
-                const logContainer = document.getElementById('log-container');
-                const logTitle = document.querySelector('#log-section h2');
-                const isScrolledToBottom = logContainer.scrollHeight - logContainer.clientHeight <= logContainer.scrollTop + 1;
-                logTitle.innerText = \`实时日志 (最近 \${data.logCount} 条)\`;
-                logContainer.innerText = data.logs;
-                if (isScrolledToBottom) { logContainer.scrollTop = logContainer.scrollHeight; }
-            }).catch(error => console.error('Error fetching new content:', error));
-        }
-
-        function switchSpecificAccount() {
-            const selectElement = document.getElementById('accountIndexSelect');
-            const targetIndex = selectElement.value;
-            if (!confirm(\`确定要切换到账号 #\${targetIndex} 吗？这会重置浏览器会话。\`)) {
-                return;
-            }
-            fetch('/api/switch-account', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ targetIndex: parseInt(targetIndex, 10) })
-            })
-            .then(res => res.text()).then(data => { alert(data); updateContent(); })
-            .catch(err => { 
-                if (err.message.includes('Load failed') || err.message.includes('NetworkError')) {
-                    alert('⚠️ 浏览器启动较慢，操作仍在后台进行中。\\n\\n请不要重复点击。');
-                } else {
-                    alert('❌ 操作失败: ' + err); 
-                }
-                updateContent(); 
-            });
-        }
-            
-        function toggleStreamingMode() { 
-            const newMode = prompt('请输入新的流模式 (real 或 fake):', '${
-              this.config.streamingMode
-            }');
-            if (newMode === 'fake' || newMode === 'real') {
-                fetch('/api/set-mode', { 
-                    method: 'POST', 
-                    headers: { 'Content-Type': 'application/json' }, 
-                    body: JSON.stringify({ mode: newMode }) 
-                })
-                .then(res => res.text()).then(data => { alert(data); updateContent(); })
-                .catch(err => alert('设置失败: ' + err));
-            } else if (newMode !== null) { 
-                alert('无效的模式！请只输入 "real" 或 "fake"。'); 
-            } 
-        }
-
-        function toggleForceThinking() {
-            fetch('/api/toggle-force-thinking', { 
-                method: 'POST', 
-                headers: { 'Content-Type': 'application/json' }
-            })
-            .then(res => res.text()).then(data => { alert(data); updateContent(); })
-            .catch(err => alert('设置失败: ' + err));
-        }
-
-        document.addEventListener('DOMContentLoaded', () => {
-            updateContent(); 
-            setInterval(updateContent, 5000);
-        });
-        </script>
-    </body>
-    </html>
-    `;
-      res.status(200).send(statusHtml);
+      res.status(200).send(this._renderPanelHtml());
     });
 
     app.get("/api/status", isAuthenticated, (req, res) => {
-      const { config, requestHandler, authSource, browserManager } = this;
-      const initialIndices = authSource.initialIndices || [];
-      const invalidIndices = initialIndices.filter(
-        (i) => !authSource.availableIndices.includes(i),
-      );
-      const logs = this.logger.logBuffer || [];
-      const accountNameMap = authSource.accountNameMap;
-      const accountDetails = initialIndices.map((index) => {
-        const isInvalid = invalidIndices.includes(index);
-        const name = isInvalid
-          ? "N/A (JSON格式错误)"
-          : accountNameMap.get(index) || "N/A (未命名)";
-        return { index, name };
-      });
-
-      const data = {
-        status: {
-          streamingMode: `${this.streamingMode} (仅启用流式传输时生效)`,
-          forceThinking: this.forceThinking ? "✅ 已启用" : "❌ 已关闭",
-          browserConnected: !!browserManager.browser,
-          immediateSwitchStatusCodes:
-            config.immediateSwitchStatusCodes.length > 0
-              ? `[${config.immediateSwitchStatusCodes.join(", ")}]`
-              : "已禁用",
-          apiKeySource: config.apiKeySource,
-          currentAuthIndex: requestHandler.currentAuthIndex,
-          usageCount: `${requestHandler.usageCount} / ${
-            config.switchOnUses > 0 ? config.switchOnUses : "N/A"
-          }`,
-          failureCount: `${requestHandler.failureCount} / ${
-            config.failureThreshold > 0 ? config.failureThreshold : "N/A"
-          }`,
-          initialIndices: `[${initialIndices.join(", ")}] (总数: ${
-            initialIndices.length
-          })`,
-          accountDetails: accountDetails,
-          invalidIndices: `[${invalidIndices.join(", ")}] (总数: ${
-            invalidIndices.length
-          })`,
-        },
-        logs: logs.join("\n"),
-        logCount: logs.length,
-      };
-      res.json(data);
+      const d = this._collectStatus();
+      res.json({ status: d.status, logs: d.logs, logCount: d.logCount });
     });
     app.post("/api/switch-account", isAuthenticated, async (req, res) => {
       try {
@@ -3031,6 +3081,414 @@ class ProxyServerSystem extends EventEmitter {
       const statusText = this.forceThinking ? "已启用" : "已关闭";
       this.logger.info(`[WebUI] 强制推理开关已切换为: ${statusText}`);
       res.status(200).send(`强制推理模式: ${statusText}`);
+    });
+
+    app.post("/api/set-switch-on-uses", isAuthenticated, (req, res) => {
+      const raw = req.body.switchOnUses;
+      const parsed = parseInt(raw, 10);
+      if (!Number.isInteger(parsed) || parsed < 0 || parsed > 1000) {
+        return res
+          .status(400)
+          .send("无效数值. 请输入 0-1000 之间的整数 (0 = 关闭轮换)。");
+      }
+      const old = this.config.switchOnUses;
+      this.config.switchOnUses = parsed;
+      this.requestHandler.usageCount = 0;
+      this.stateStore.setConfig("switchOnUses", parsed);
+      this.logger.info(
+        `[WebUI] 轮换阈值已由认证用户修改: ${old} -> ${parsed}，使用计数已清零。`,
+      );
+      res
+        .status(200)
+        .send(
+          parsed > 0
+            ? `轮换阈值已设为 ${parsed} 次 (原 ${old})，已保存。`
+            : `轮换计数已关闭 (原 ${old})，已保存。`,
+        );
+    });
+
+    // ---------- 配置修改（持久化到 state.json） ----------
+
+    app.post("/api/set-config", isAuthenticated, (req, res) => {
+      const { key, value } = req.body;
+      const numericKeys = {
+        switchOnUses: [0, 1000],
+        failureThreshold: [0, 100],
+        maxRetries: [0, 10],
+        retryDelay: [0, 60000],
+        cooldownMinutes: [1, 1440],
+        dailyQuotaPerModel: [1, 100000],
+        httpPort: [1, 65535],
+      };
+
+      try {
+        let parsed = value;
+
+        if (numericKeys[key]) {
+          const [min, max] = numericKeys[key];
+          parsed = parseInt(value, 10);
+          if (!Number.isInteger(parsed) || parsed < min || parsed > max) {
+            return res
+              .status(400)
+              .send(`${key} 需为 ${min}-${max} 之间的整数。`);
+          }
+        } else if (key === "streamingMode") {
+          if (value !== "real" && value !== "fake") {
+            return res.status(400).send('streamingMode 只能是 "real" 或 "fake"。');
+          }
+        } else if (key === "autoBanEnabled" || key === "cooldownEnabled") {
+          parsed = value === true || value === "true";
+        } else if (
+          key === "immediateSwitchStatusCodes" ||
+          key === "autoBanStatusCodes"
+        ) {
+          parsed = String(value)
+            .split(",")
+            .map((s) => parseInt(s.trim(), 10))
+            .filter((n) => Number.isInteger(n) && n >= 100 && n <= 599);
+          if (parsed.length === 0) {
+            return res.status(400).send("请输入至少一个有效状态码，如 429,503。");
+          }
+        } else if (key === "apiKeys") {
+          parsed = String(value)
+            .split(",")
+            .map((s) => s.trim())
+            .filter(Boolean);
+          if (parsed.length === 0) {
+            return res.status(400).send("API Key 不能为空。");
+          }
+          if (parsed.some((k) => k.length < 6)) {
+            return res.status(400).send("每个 API Key 至少 6 个字符。");
+          }
+        } else if (key === "host") {
+          if (!/^[\w.:-]+$/.test(String(value))) {
+            return res.status(400).send("主机地址格式不正确。");
+          }
+          parsed = String(value);
+        } else if (key === "targetUrl") {
+          if (!/^https:\/\/ai\.studio\/apps\/[\w-]+/.test(String(value))) {
+            return res
+              .status(400)
+              .send("请填入形如 https://ai.studio/apps/<uuid> 的公开 app 链接。");
+          }
+          parsed = String(value);
+        } else {
+          return res.status(400).send(`配置项 "${key}" 不支持从面板修改。`);
+        }
+
+        this.config[key] = parsed;
+        this.stateStore.setConfig(key, parsed);
+
+        if (key === "streamingMode") this.streamingMode = parsed;
+        if (key === "switchOnUses") this.requestHandler.usageCount = 0;
+
+        const needsRestart = key === "host" || key === "httpPort";
+        this.logger.info(`[WebUI] 配置已修改并保存: ${key}`);
+        res
+          .status(200)
+          .send(
+            needsRestart
+              ? `${key} 已保存，但需要重启服务才会重新绑定端口。`
+              : `${key} 已保存并立即生效。`,
+          );
+      } catch (e) {
+        res.status(400).send(`保存失败: ${e.message}`);
+      }
+    });
+
+    app.post("/api/set-panel-password", isAuthenticated, (req, res) => {
+      const { password } = req.body;
+      if (password === "" || password === null) {
+        this.stateStore.clearPanelPassword();
+        this.logger.info("[WebUI] 面板独立密码已清除，恢复使用 API Key 登录。");
+        return res.status(200).send("已清除面板独立密码，改用 API Key 登录。");
+      }
+      if (typeof password !== "string" || password.length < 6) {
+        return res.status(400).send("面板密码至少 6 个字符。");
+      }
+      this.stateStore.setPanelPassword(password);
+      this.logger.info("[WebUI] 面板独立密码已更新（仅存哈希）。");
+      res.status(200).send("面板密码已更新。下次登录请使用新密码。");
+    });
+
+    // ---------- 凭证管理 ----------
+
+    app.post("/api/credential/import", isAuthenticated, (req, res) => {
+      const { content, format, index } = req.body;
+      try {
+        if (!content || typeof content !== "string") {
+          return res.status(400).send("请粘贴凭证内容。");
+        }
+
+        let state;
+        if (format === "cookies") {
+          state = cookiesToStorageState(content);
+        } else {
+          state = JSON.parse(content);
+        }
+
+        const check = validateStorageState(state);
+        if (!check.ok) {
+          return res
+            .status(400)
+            .send(`凭证校验未通过：\n- ${check.problems.join("\n- ")}`);
+        }
+
+        const authDir = path.join(__dirname, "auth");
+        if (!fs.existsSync(authDir)) fs.mkdirSync(authDir, { recursive: true });
+
+        let targetIndex = parseInt(index, 10);
+        if (!Number.isInteger(targetIndex) || targetIndex < 1) {
+          const existing = fs
+            .readdirSync(authDir)
+            .map((f) => (f.match(/^auth-(\d+)\.json$/) || [])[1])
+            .filter(Boolean)
+            .map(Number);
+          targetIndex = existing.length ? Math.max(...existing) + 1 : 1;
+        }
+
+        fs.writeFileSync(
+          path.join(authDir, `auth-${targetIndex}.json`),
+          JSON.stringify(state, null, 2),
+          "utf-8",
+        );
+
+        this.stateStore.cred(targetIndex).enabled = true;
+        this.stateStore.unban(targetIndex);
+        this.authSource.rescan();
+
+        this.logger.info(
+          `[WebUI] 已导入凭证 auth-${targetIndex}.json (${check.stats.googleCookieCount} 个 google cookie)。`,
+        );
+        res
+          .status(200)
+          .send(
+            `已导入为账号 #${targetIndex}\n账号: ${
+              check.stats.accountName || "未识别"
+            }\ncookie: ${check.stats.googleCookieCount} 个${
+              check.stats.hasLocalStorage ? "" : "\n注意: 无 localStorage，可能较快过期"
+            }`,
+          );
+      } catch (e) {
+        res.status(400).send(`导入失败: ${e.message}`);
+      }
+    });
+
+    app.post("/api/credential/set-url", isAuthenticated, (req, res) => {
+      const index = parseInt(req.body.index, 10);
+      const url = String(req.body.url || "").trim();
+      if (!Number.isInteger(index)) {
+        return res.status(400).send("无效的账号编号。");
+      }
+      if (url === "") {
+        this.stateStore.setCredTargetUrl(index, null);
+        this.logger.info(
+          `[WebUI] 账号 #${index} 的专属 app 链接已清除，将回落到全局链接。`,
+        );
+        return res
+          .status(200)
+          .send(`账号 #${index} 已清除专属链接，改用全局链接。\n重启或切换到该账号后生效。`);
+      }
+      if (!/^https:\/\/ai\.studio\/apps\/[\w-]+/.test(url)) {
+        return res
+          .status(400)
+          .send("请填入形如 https://ai.studio/apps/<uuid> 的公开 app 链接。");
+      }
+      this.stateStore.setCredTargetUrl(index, url);
+      this.logger.info(`[WebUI] 账号 #${index} 已设置专属 app 链接。`);
+      res
+        .status(200)
+        .send(
+          `账号 #${index} 的专属链接已保存。\n下次切换到该账号时生效（当前账号可点"切换到此账号"立即重载）。`,
+        );
+    });
+
+    app.post("/api/set-theme", isAuthenticated, (req, res) => {
+      const t = req.body.theme === "light" ? "light" : "dark";
+      this.config.theme = t;
+      this.stateStore.setConfig("theme", t);
+      res.status(200).send(t);
+    });
+
+    app.post("/api/credential/toggle", isAuthenticated, (req, res) => {
+      const index = parseInt(req.body.index, 10);
+      if (!Number.isInteger(index)) {
+        return res.status(400).send("无效的账号编号。");
+      }
+      const cred = this.stateStore.cred(index);
+      const next = !cred.enabled;
+
+      if (!next) {
+        const stillUsable = (this.authSource.validIndices || []).filter(
+          (i) => i !== index && this.stateStore.isUsable(i),
+        );
+        if (stillUsable.length === 0) {
+          return res
+            .status(400)
+            .send("这是最后一个可用凭证，关闭后服务将无法工作。");
+        }
+      }
+
+      this.stateStore.setEnabled(index, next);
+      this.authSource.rescan();
+      this.logger.info(
+        `[WebUI] 账号 #${index} 已${next ? "启用" : "停用"}。`,
+      );
+      res.status(200).send(`账号 #${index} 已${next ? "启用" : "停用"}。`);
+    });
+
+    app.post("/api/credential/unban", isAuthenticated, (req, res) => {
+      const index = parseInt(req.body.index, 10);
+      if (!Number.isInteger(index)) {
+        return res.status(400).send("无效的账号编号。");
+      }
+      this.stateStore.unban(index);
+      this.stateStore.clearCooldowns(index);
+      this.authSource.rescan();
+      this.logger.info(`[WebUI] 账号 #${index} 已解除封禁并清除冷却。`);
+      res.status(200).send(`账号 #${index} 已解除封禁，冷却已清除。`);
+    });
+
+    app.post("/api/credential/validate", isAuthenticated, (req, res) => {
+      const index = parseInt(req.body.index, 10);
+      const raw = this.authSource._getAuthContent(index);
+      if (!raw) {
+        return res.status(400).send(`读取账号 #${index} 失败。`);
+      }
+      try {
+        const check = validateStorageState(JSON.parse(raw));
+        this.stateStore.recordCheck(
+          index,
+          check.ok,
+          check.ok ? "格式校验通过" : check.problems.join("; "),
+        );
+        const lines = [
+          `账号 #${index} 格式校验：${check.ok ? "通过" : "未通过"}`,
+          `账号名: ${check.stats.accountName || "未识别"}`,
+          `cookie 总数: ${check.stats.cookieCount}（google 域 ${check.stats.googleCookieCount}）`,
+          `localStorage: ${check.stats.hasLocalStorage ? "有" : "无"}`,
+        ];
+        if (!check.ok) lines.push("", "问题:", ...check.problems.map((p) => "- " + p));
+        lines.push(
+          "",
+          "说明: 这是离线格式校验，不代表登录态仍然有效。",
+          '要确认是否过期，请用"实测"按钮发一次真实请求。',
+        );
+        res.status(200).send(lines.join("\n"));
+      } catch (e) {
+        this.stateStore.recordCheck(index, false, e.message);
+        res.status(400).send(`账号 #${index} JSON 解析失败: ${e.message}`);
+      }
+    });
+
+    app.post("/api/credential/test", isAuthenticated, async (req, res) => {
+      const index = parseInt(req.body.index, 10);
+      const model =
+        req.body.model || (this.config.modelList && this.config.modelList[0]);
+      if (!Number.isInteger(index) || !model) {
+        return res.status(400).send("需要账号编号和模型名。");
+      }
+
+      const originalIndex = this.requestHandler.currentAuthIndex;
+      try {
+        if (index !== originalIndex) {
+          const sw = await this.requestHandler._switchToSpecificAuth(index);
+          if (!sw.success) {
+            return res.status(400).send(`切换到账号 #${index} 失败: ${sw.reason}`);
+          }
+        }
+
+        const probe = {
+          path: `/v1beta/models/${model}:generateContent`,
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          query_params: {},
+          body: JSON.stringify({
+            contents: [{ role: "user", parts: [{ text: "ping" }] }],
+          }),
+          request_id: this.requestHandler._generateRequestId(),
+          is_generative: false,
+          streaming_mode: "fake",
+        };
+
+        const result = await this.requestHandler._executeProbe(probe);
+        const ok = result.status === 200;
+        this.stateStore.recordCheck(
+          index,
+          ok,
+          ok ? `实测 ${model} 成功` : `实测 ${model} 返回 ${result.status}`,
+        );
+        res
+          .status(ok ? 200 : 400)
+          .send(
+            `账号 #${index} 实测 ${model}: ${
+              ok ? "成功" : "失败"
+            }\nHTTP ${result.status}\n${String(result.body || "").slice(0, 400)}`,
+          );
+      } catch (e) {
+        this.stateStore.recordCheck(index, false, e.message);
+        res.status(500).send(`实测出错: ${e.message}`);
+      }
+    });
+
+    app.get("/api/credential/export", isAuthenticated, (req, res) => {
+      const index = parseInt(req.query.index, 10);
+      const raw = this.authSource._getAuthContent(index);
+      if (!raw) {
+        return res.status(404).send("找不到该凭证。");
+      }
+      res.setHeader("Content-Type", "application/json; charset=utf-8");
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="auth-${index}.json"`,
+      );
+      res.send(raw);
+    });
+
+    app.post("/api/credential/delete", isAuthenticated, (req, res) => {
+      const index = parseInt(req.body.index, 10);
+      if (!Number.isInteger(index)) {
+        return res.status(400).send("无效的账号编号。");
+      }
+      const stillUsable = (this.authSource.validIndices || []).filter(
+        (i) => i !== index && this.stateStore.isUsable(i),
+      );
+      if (stillUsable.length === 0) {
+        return res.status(400).send("这是最后一个可用凭证，不能删除。");
+      }
+      try {
+        const p = path.join(__dirname, "auth", `auth-${index}.json`);
+        if (fs.existsSync(p)) fs.unlinkSync(p);
+        this.stateStore.forget(index);
+        this.authSource.rescan();
+        this.logger.info(`[WebUI] 已删除凭证 auth-${index}.json。`);
+        res.status(200).send(`账号 #${index} 已删除。`);
+      } catch (e) {
+        res.status(500).send(`删除失败: ${e.message}`);
+      }
+    });
+
+    app.post("/api/rescan", isAuthenticated, (req, res) => {
+      const r = this.authSource.rescan();
+      res
+        .status(200)
+        .send(
+          `重新扫描完成。\n发现: [${r.initial.join(", ")}]\n可用: [${r.available.join(
+            ", ",
+          )}]`,
+        );
+    });
+
+    app.post("/api/clear-cooldowns", isAuthenticated, (req, res) => {
+      const index = req.body.index;
+      if (index === undefined || index === null || index === "") {
+        this.stateStore.clearCooldowns();
+        this.logger.info("[WebUI] 已清除全部模型族冷却。");
+        return res.status(200).send("已清除全部冷却。");
+      }
+      const i = parseInt(index, 10);
+      this.stateStore.clearCooldowns(i);
+      res.status(200).send(`已清除账号 #${i} 的冷却。`);
     });
 
     app.use(this._createAuthMiddleware());

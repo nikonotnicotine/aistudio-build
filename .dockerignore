@@ -1,0 +1,26 @@
+# 构建上下文排除：camoufox 由 Dockerfile 在镜像内下载，
+# 凭证和本地配置绝不进镜像。
+camoufox/
+camoufox-linux/
+node_modules/
+
+# 凭证与本地配置
+auth/
+single-line-auth/
+.auth
+config.json
+state.json
+app.env
+*.env
+data/
+
+# 仓库杂项
+.git/
+.github/
+.gitignore
+*.bak
+*.log
+logs/
+shots/
+*.png
+README.md
