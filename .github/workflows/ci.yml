@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+jobs:
+  check:
+    name: 语法与构建一致性
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+
+      # 不装依赖也能做语法检查，快且不受 npm 波动影响
+      - name: 语法检查
+        run: |
+          for f in unified-server.js panel.js state-store.js save-auth.js \
+                   black-browser.js scripts/check-build-consistency.js; do
+            node --check "$f" && echo "  ok    $f"
+          done
+
+      - name: JSON 格式检查
+        run: |
+          for f in package.json models.json; do
+            node -e "JSON.parse(require('fs').readFileSync('$f','utf8'))" \
+              && echo "  ok    $f"
+          done
+
+      # 挡住「新增模块忘了加进 Dockerfile 的 COPY」这类问题：
+      # 本地跑得好好的，容器一启动就 MODULE_NOT_FOUND。本仓库真实发生过。
+      - name: 构建一致性检查
+        run: node scripts/check-build-consistency.js
+
+      - name: 依赖可安装
+        run: npm ci --omit=dev --ignore-scripts
+
+  docker:
+    name: Dockerfile 可构建
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # 只构建到安装系统依赖和 npm 依赖为止，不下载 camoufox。
+      # 官方 camoufox 发布的是扁平 zip，而 Dockerfile 需要
+      # camoufox-linux/ 目录结构的 tar.gz，CI 里没有现成的包可用。
+      # 这一步要验证的是 apt / npm 层和 COPY 指令本身没写错。
+      - name: 构建（跳过浏览器下载层）
+        run: |
+          sed '/^ARG CAMOUFOX_URL$/,/chmod +x \/app\/camoufox-linux\/camoufox$/d' \
+            Dockerfile > Dockerfile.ci
+          docker build -f Dockerfile.ci -t aistudio-build:ci .
+
+      - name: 确认模块都在镜像里
+        run: |
+          for f in unified-server.js panel.js state-store.js \
+                   black-browser.js models.json; do
+            docker run --rm --entrypoint sh aistudio-build:ci \
+              -c "test -f /app/$f" && echo "  ok    /app/$f"
+          done
+
+      # 真正的回归检查：模块能被 require 进来。
+      # 漏拷文件时这里会直接 MODULE_NOT_FOUND。
+      - name: 确认模块可加载
+        run: |
+          docker run --rm --entrypoint node aistudio-build:ci \
+            -e "require('/app/panel.js'); require('/app/state-store.js');
+                console.log('  ok    本地模块均可 require')"
